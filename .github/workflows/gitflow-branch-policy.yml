@@ -1,23 +1,101 @@
-name: Enforce gitflow
+name: Enforce feature branches from updated develop
 
 on:
+  push:
+    branches:
+      - 'feature/**'
   pull_request:
     types: [opened, reopened, synchronize, edited]
+    branches:
+      - develop
 
 permissions:
-  statuses: write
   contents: read
   pull-requests: read
 
 jobs:
-  branch-policy:
+  validate-feature-branch:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Enforce branch flow
-        uses: ncalteen/branch-enforcement@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          policy: |
-            develop:release/*
-            feature/*:develop
-          head_ref: ${{ github.head_ref }}
-          base_ref: ${{ github.base_ref }}
+          fetch-depth: 0
+
+      - name: Determine refs
+        id: refs
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "branch_name=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
+            echo "base_name=${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "base_name=develop" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate naming and PR target
+        shell: bash
+        run: |
+          BRANCH="${{ steps.refs.outputs.branch_name }}"
+          BASE="${{ steps.refs.outputs.base_name }}"
+
+          echo "Branch: $BRANCH"
+          echo "Base:   $BASE"
+
+          if [[ ! "$BRANCH" =~ ^feature\/.+$ ]]; then
+            echo "Esta validación solo aplica a ramas feature/*"
+            exit 1
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" && "$BASE" != "develop" ]]; then
+            echo "ERROR: una rama feature/* solo puede abrir PR contra develop."
+            exit 1
+          fi
+
+      - name: Fetch develop
+        shell: bash
+        run: |
+          git fetch origin develop --no-tags
+
+      - name: Validate branch was created from latest develop
+        shell: bash
+        run: |
+          BRANCH="${{ steps.refs.outputs.branch_name }}"
+
+          # SHA actual del último develop remoto
+          DEVELOP_SHA="$(git rev-parse origin/develop)"
+          echo "origin/develop = $DEVELOP_SHA"
+
+          # En push, GITHUB_SHA suele ser el commit actual de la rama
+          # En pull_request, comprobamos la rama remota del PR
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch origin "$BRANCH" --no-tags
+            FEATURE_SHA="$(git rev-parse "origin/$BRANCH")"
+          else
+            FEATURE_SHA="$(git rev-parse HEAD)"
+          fi
+
+          echo "feature sha    = $FEATURE_SHA"
+
+          # Regla estricta:
+          # el merge-base entre feature y origin/develop debe ser exactamente origin/develop
+          # Eso significa que la feature contiene el último develop completo.
+          MERGE_BASE="$(git merge-base "$FEATURE_SHA" origin/develop)"
+          echo "merge-base     = $MERGE_BASE"
+
+          if [[ "$MERGE_BASE" != "$DEVELOP_SHA" ]]; then
+            echo "ERROR: la rama feature/* no parte del último origin/develop."
+            echo "Debes recrearla o rebasarla sobre develop actualizado."
+            echo
+            echo "Flujo correcto:"
+            echo "  git fetch origin"
+            echo "  git switch develop"
+            echo "  git pull --ff-only origin develop"
+            echo "  git switch -c feature/tu-rama"
+            exit 1
+          fi
+
+      - name: Success
+        run: echo "Branch policy OK"
