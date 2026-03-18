@@ -1,20 +1,23 @@
-name: Enforce feature branches from updated develop
+name: Enforce branch origin policy
 
 on:
   push:
     branches:
       - 'feature/**'
+      - 'release/**'
+      - 'hotfix/**'
   pull_request:
     types: [opened, reopened, synchronize, edited]
     branches:
       - develop
+      - main
 
 permissions:
   contents: read
   pull-requests: read
 
 jobs:
-  validate-feature-branch:
+  validate-branch-origin:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,77 +26,85 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine refs
-        id: refs
+      - name: Determine branch and expected base
+        id: vars
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "branch_name=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
-            echo "base_name=${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+            BRANCH="${{ github.head_ref }}"
+            PR_BASE="${{ github.base_ref }}"
           else
-            echo "branch_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "base_name=develop" >> "$GITHUB_OUTPUT"
+            BRANCH="${GITHUB_REF_NAME}"
+            PR_BASE=""
           fi
 
-      - name: Validate naming and PR target
-        shell: bash
-        run: |
-          BRANCH="${{ steps.refs.outputs.branch_name }}"
-          BASE="${{ steps.refs.outputs.base_name }}"
-
-          echo "Branch: $BRANCH"
-          echo "Base:   $BASE"
-
-          if [[ ! "$BRANCH" =~ ^feature\/.+$ ]]; then
-            echo "Esta validación solo aplica a ramas feature/*"
+          if [[ "$BRANCH" == feature/* ]]; then
+            EXPECTED_BASE="develop"
+          elif [[ "$BRANCH" == release/* ]]; then
+            EXPECTED_BASE="develop"
+          elif [[ "$BRANCH" == hotfix/* ]]; then
+            EXPECTED_BASE="main"
+          else
+            echo "ERROR: rama no soportada por esta política: $BRANCH"
             exit 1
           fi
 
-          if [[ "${{ github.event_name }}" == "pull_request" && "$BASE" != "develop" ]]; then
-            echo "ERROR: una rama feature/* solo puede abrir PR contra develop."
+          echo "branch_name=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr_base=$PR_BASE" >> "$GITHUB_OUTPUT"
+          echo "expected_base=$EXPECTED_BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Validate PR target branch
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          BRANCH="${{ steps.vars.outputs.branch_name }}"
+          PR_BASE="${{ steps.vars.outputs.pr_base }}"
+          EXPECTED_BASE="${{ steps.vars.outputs.expected_base }}"
+
+          echo "Branch:        $BRANCH"
+          echo "PR target:     $PR_BASE"
+          echo "Expected base: $EXPECTED_BASE"
+
+          if [[ "$PR_BASE" != "$EXPECTED_BASE" ]]; then
+            echo "ERROR: la rama $BRANCH solo puede abrir PR contra $EXPECTED_BASE."
             exit 1
           fi
 
-      - name: Fetch develop
+      - name: Fetch expected base branch
         shell: bash
         run: |
-          git fetch origin develop --no-tags
+          BASE="${{ steps.vars.outputs.expected_base }}"
+          git fetch origin "$BASE" --no-tags
 
-      - name: Validate branch was created from latest develop
+      - name: Validate branch is based on latest expected base
         shell: bash
         run: |
-          BRANCH="${{ steps.refs.outputs.branch_name }}"
+          BRANCH="${{ steps.vars.outputs.branch_name }}"
+          BASE="${{ steps.vars.outputs.expected_base }}"
 
-          # SHA actual del último develop remoto
-          DEVELOP_SHA="$(git rev-parse origin/develop)"
-          echo "origin/develop = $DEVELOP_SHA"
+          BASE_SHA="$(git rev-parse "origin/$BASE")"
+          echo "origin/$BASE = $BASE_SHA"
 
-          # En push, GITHUB_SHA suele ser el commit actual de la rama
-          # En pull_request, comprobamos la rama remota del PR
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             git fetch origin "$BRANCH" --no-tags
-            FEATURE_SHA="$(git rev-parse "origin/$BRANCH")"
+            BRANCH_SHA="$(git rev-parse "origin/$BRANCH")"
           else
-            FEATURE_SHA="$(git rev-parse HEAD)"
+            BRANCH_SHA="$(git rev-parse HEAD)"
           fi
 
-          echo "feature sha    = $FEATURE_SHA"
+          echo "$BRANCH = $BRANCH_SHA"
 
-          # Regla estricta:
-          # el merge-base entre feature y origin/develop debe ser exactamente origin/develop
-          # Eso significa que la feature contiene el último develop completo.
-          MERGE_BASE="$(git merge-base "$FEATURE_SHA" origin/develop)"
-          echo "merge-base     = $MERGE_BASE"
+          MERGE_BASE="$(git merge-base "$BRANCH_SHA" "origin/$BASE")"
+          echo "merge-base = $MERGE_BASE"
 
-          if [[ "$MERGE_BASE" != "$DEVELOP_SHA" ]]; then
-            echo "ERROR: la rama feature/* no parte del último origin/develop."
-            echo "Debes recrearla o rebasarla sobre develop actualizado."
+          if [[ "$MERGE_BASE" != "$BASE_SHA" ]]; then
+            echo "ERROR: la rama $BRANCH no parte del último origin/$BASE."
             echo
-            echo "Flujo correcto:"
+            echo "Debes crearla desde $BASE actualizado:"
             echo "  git fetch origin"
-            echo "  git switch develop"
-            echo "  git pull --ff-only origin develop"
-            echo "  git switch -c feature/tu-rama"
+            echo "  git switch $BASE"
+            echo "  git pull --ff-only origin $BASE"
+            echo "  git switch -c $BRANCH"
             exit 1
           fi
 
